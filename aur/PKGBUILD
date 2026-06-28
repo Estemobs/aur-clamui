@@ -1,0 +1,88 @@
+# Maintainer: estemobs <estemobsgaming@gmail.com>
+pkgname=clamui
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Modern GTK4/libadwaita graphical interface for the ClamAV antivirus scanner"
+arch=('any')
+url="https://github.com/linx-systems/clamui"
+license=('MIT')
+depends=(
+  'python'
+  'python-gobject'
+  'python-cairo'
+  'python-psutil'
+  'python-matplotlib'
+  'python-requests'
+  'python-urllib3'
+  'python-certifi'
+  'python-keyring'
+  'python-pillow'
+  'python-cairosvg'
+  'gtk4'
+  'libadwaita'
+  'clamav'
+  'polkit'
+  'hicolor-icon-theme'
+  'desktop-file-utils'
+)
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-hatchling' 'gettext')
+optdepends=(
+  'libdbusmenu-glib: system tray right-click menu'
+  'gnome-shell-extension-appindicator-git: system tray icon support on GNOME Shell'
+  'nautilus: "Scan with ClamUI" context menu (GNOME Files)'
+  'dolphin: "Scan with ClamUI" service menu (KDE)'
+  'nemo: "Scan with ClamUI" action (Cinnamon)'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/linx-systems/clamui/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('ea6da57595c3d4265f43f3435bd39e1a38fd1529a3628e35654b84cb6dc799a5')
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  install -Dm644 data/io.github.linx_systems.ClamUI.desktop \
+    "$pkgdir/usr/share/applications/io.github.linx_systems.ClamUI.desktop"
+  install -Dm644 data/io.github.linx_systems.ClamUI.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.linx_systems.ClamUI.metainfo.xml"
+  install -Dm644 data/io.github.linx_systems.ClamUI.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.linx_systems.ClamUI.policy"
+
+  install -Dm644 icons/io.github.linx_systems.ClamUI.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.linx_systems.ClamUI.svg"
+  install -Dm644 icons/io.github.linx_systems.ClamUI.png \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/io.github.linx_systems.ClamUI.png"
+
+  # File manager context-menu integrations
+  install -Dm755 scripts/clamui-scan-nautilus.sh \
+    "$pkgdir/usr/share/clamui/integrations/clamui-scan-nautilus.sh"
+  install -Dm755 scripts/clamui-virustotal-nautilus.sh \
+    "$pkgdir/usr/share/clamui/integrations/clamui-virustotal-nautilus.sh"
+  install -Dm644 data/io.github.linx_systems.ClamUI.nemo_action \
+    "$pkgdir/usr/share/nemo/actions/io.github.linx_systems.ClamUI.nemo_action"
+  install -Dm644 data/io.github.linx_systems.ClamUI-virustotal.nemo_action \
+    "$pkgdir/usr/share/nemo/actions/io.github.linx_systems.ClamUI-virustotal.nemo_action"
+  install -Dm644 data/io.github.linx_systems.ClamUI.service.desktop \
+    "$pkgdir/usr/share/kio/servicemenus/io.github.linx_systems.ClamUI.service.desktop"
+  install -Dm644 data/io.github.linx_systems.ClamUI-virustotal.desktop \
+    "$pkgdir/usr/share/kio/servicemenus/io.github.linx_systems.ClamUI-virustotal.desktop"
+
+  # Translations
+  if [ -f po/LINGUAS ]; then
+    while IFS= read -r lang || [ -n "$lang" ]; do
+      lang="${lang%%#*}"
+      lang="$(echo "$lang" | tr -d '[:space:]')"
+      [ -z "$lang" ] && continue
+      [ -f "po/$lang.po" ] || continue
+      install -d "$pkgdir/usr/share/locale/$lang/LC_MESSAGES"
+      msgfmt -o "$pkgdir/usr/share/locale/$lang/LC_MESSAGES/clamui.mo" "po/$lang.po"
+    done < po/LINGUAS
+  fi
+}

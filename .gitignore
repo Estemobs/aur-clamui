@@ -82,6 +82,12 @@ repo/
 *.deb
 build-deb-temp/
 
+# AUR packaging (makepkg build artifacts)
+/aur/pkg/
+/aur/src/
+/aur/*.tar.gz
+/aur/*.pkg.tar.*
+
 .claude/
 pypi_cache
 .tldr
