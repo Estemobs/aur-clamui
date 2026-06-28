@@ -34,6 +34,8 @@
 
 <br>
 
+> **About this fork:** This repository is a fork of [linx-systems/clamui](https://github.com/linx-systems/clamui) maintained to package and host the **Arch Linux (AUR) build** of ClamUI — see [`aur/`](./aur/) for the PKGBUILD. The goal is simply to make ClamUI easy to install on Arch Linux and Arch-based distributions (Manjaro, EndeavourOS, CachyOS, etc.). All credit for ClamUI itself goes to the upstream project.
+
 ---
 
 ## Features
@@ -122,6 +124,17 @@ ClamUI provides a comprehensive set of features designed to make antivirus prote
 ```bash
 flatpak install flathub io.github.linx_systems.ClamUI
 flatpak run io.github.linx_systems.ClamUI
+```
+
+### Arch Linux (AUR)
+
+This fork maintains the Arch Linux packaging (see [`aur/PKGBUILD`](./aur/PKGBUILD)). Until the package is published on the
+AUR, build and install it directly from this repository:
+
+```bash
+git clone https://github.com/Estemobs/clamui.git
+cd clamui/aur
+makepkg -si
 ```
 
 ### From Source
