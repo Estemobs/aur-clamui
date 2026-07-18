@@ -1,0 +1,103 @@
+name: AUR PKGBUILD Bump
+
+# Watches linx-systems/clamui (upstream) for new GitHub releases and keeps
+# aur/PKGBUILD in sync. On a version bump it opens a PR updating pkgver,
+# resetting pkgrel to 1, and recomputing sha256sums. If anything about that
+# process fails (tarball missing, checksum step errors, etc.) it opens an
+# issue instead so the drift doesn't go unnoticed.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Determine current and latest version
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=$(grep -Po '^pkgver=\K.*' aur/PKGBUILD)
+          latest=$(gh release view --repo linx-systems/clamui --json tagName --jq '.tagName' | sed 's/^v//')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump PKGBUILD
+        if: steps.versions.outputs.up_to_date == 'false'
+        id: bump
+        run: |
+          set -euo pipefail
+          old="${{ steps.versions.outputs.current }}"
+          new="${{ steps.versions.outputs.latest }}"
+          url="https://github.com/linx-systems/clamui/archive/refs/tags/v${new}.tar.gz"
+
+          tarball="$(mktemp)"
+          curl -fsSL -o "$tarball" "$url"
+          sha=$(sha256sum "$tarball" | cut -d' ' -f1)
+
+          sed -i "s/^pkgver=.*/pkgver=${new}/" aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${sha}')/" aur/PKGBUILD
+
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.versions.outputs.up_to_date == 'false' && success()
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          branch: aur-bump-${{ steps.bump.outputs.new }}
+          commit-message: "chore(aur): bump clamui to ${{ steps.bump.outputs.new }}"
+          title: "chore(aur): bump clamui ${{ steps.bump.outputs.old }} -> ${{ steps.bump.outputs.new }}"
+          body: |
+            Upstream [linx-systems/clamui](https://github.com/linx-systems/clamui) published release
+            `v${{ steps.bump.outputs.new }}`.
+
+            This PR was opened automatically by the `AUR PKGBUILD Bump` workflow:
+            - `pkgver`: `${{ steps.bump.outputs.old }}` -> `${{ steps.bump.outputs.new }}`
+            - `pkgrel`: reset to `1`
+            - `sha256sums`: recomputed from the release tarball
+
+            Please review before merging — `makepkg` was not run in this workflow.
+          add-paths: aur/PKGBUILD
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `AUR bump failed for clamui ${{ steps.versions.outputs.latest }}`,
+              body: [
+                `The **AUR PKGBUILD Bump** workflow failed to automatically update \`aur/PKGBUILD\`.`,
+                ``,
+                `- Current pkgver: \`${{ steps.versions.outputs.current }}\``,
+                `- Latest upstream release: \`${{ steps.versions.outputs.latest }}\``,
+                `- Failed run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                ``,
+                `Please update the PKGBUILD manually.`,
+              ].join("\n"),
+              labels: ["aur", "automation"],
+            });
