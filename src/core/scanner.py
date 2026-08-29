@@ -72,11 +72,12 @@ def glob_to_regex(pattern: str) -> str:
         POSIX Extended Regular Expression string with anchors
     """
     regex = fnmatch.translate(pattern)
-    # Strip fnmatch's \Z(?ms) suffix for ClamAV compatibility
-    # fnmatch.translate() adds (?s:...) wrapper and \Z anchor
-    # We need to remove these for ClamAV's regex engine
-    if regex.endswith(r"\Z"):
-        regex = regex[:-2]
+    # Strip fnmatch Python-specific end anchors for ClamAV compatibility.
+    # Python versions before 3.14 use \Z; Python 3.14+ uses \z.
+    for suffix in (r"\Z", r"\z"):
+        if regex.endswith(suffix):
+            regex = regex[: -len(suffix)]
+            break
     # Handle newer Python versions that use (?s:pattern)\Z format
     if regex.startswith("(?s:") and regex.endswith(")"):
         regex = regex[4:-1]
@@ -92,6 +93,20 @@ def glob_to_regex(pattern: str) -> str:
     if not has_unescaped_anchor:
         regex = regex + "$"
     return regex
+
+
+def directory_glob_to_regex(pattern: str) -> str:
+    """Convert a directory exclusion glob to a ClamAV-compatible POSIX ERE.
+
+    A bare directory name is a path component, not an entire scan path. Match
+    it at the scan root or after any parent component, and require the next
+    character to be a separator or the end of the path. Path-like patterns
+    retain their existing whole-path glob semantics.
+    """
+    regex = glob_to_regex(pattern)
+    if "/" in pattern or "\\" in pattern:
+        return regex
+    return rf"(^|.*/){regex[1:-1]}(/|$)"
 
 
 def validate_pattern(pattern: str) -> bool:
@@ -821,8 +836,12 @@ class Scanner:
                 if not pattern:
                     continue
 
-                regex = glob_to_regex(pattern)
                 exclusion_type = exclusion.get("type", "pattern")
+                regex = (
+                    directory_glob_to_regex(pattern)
+                    if exclusion_type == "directory"
+                    else glob_to_regex(pattern)
+                )
 
                 if exclusion_type == "directory":
                     cmd.extend(["--exclude-dir", regex])

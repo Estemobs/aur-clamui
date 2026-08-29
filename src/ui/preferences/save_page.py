@@ -19,7 +19,6 @@ from gi.repository import Adw, GLib, Gtk
 from ...core.clamav_config import (
     ClamAVConfig,
     backup_config,
-    privileged_writer_available,
     validate_config,
     write_configs_with_elevation,
 )
@@ -216,16 +215,25 @@ class SavePage(PreferencesPageMixin):
         auto_save_row.add_prefix(auto_save_icon)
         info_group.add(auto_save_row)
 
-        # Manual save settings info row.  Running as root, every config path is
-        # directly writable and the save flow skips pkexec, so drop the
-        # "you will be asked for administrator permission" wording and the
-        # warning lock icon that would otherwise mislead an already-privileged user.
+        # System configuration writes from Flatpak always require the matching
+        # host helper; checking whether it exists is deferred to the background
+        # save operation so page creation never blocks the GTK thread.
         from ...core.privileged_paths import is_running_as_root
 
         manual_save_row = Adw.ActionRow()
         manual_save_row.set_title(_("Manual Save Required"))
         safe_set_title_lines(manual_save_row, 1)
-        if is_running_as_root():
+        if is_flatpak():
+            manual_save_row.set_subtitle(
+                _(
+                    "Database Updates, Scanner, On-Access, Scheduled Scans. "
+                    "A matching host privileged helper is required; authorization "
+                    "occurs only when the helper is available."
+                )
+            )
+            manual_icon_name = "system-lock-screen-symbolic"
+            manual_icon_css = "warning"
+        elif is_running_as_root():
             manual_save_row.set_subtitle(
                 _("Database Updates, Scanner, On-Access, Scheduled Scans.")
             )
@@ -296,7 +304,8 @@ class SavePage(PreferencesPageMixin):
         onaccess_updates = OnAccessPage.collect_data(self._onaccess_widgets, self._clamd_available)
         scheduled_updates = ScheduledPage.collect_data(self._scheduled_widgets)
 
-        # Validate configurations
+        # Validate the freshclam configuration proposal that will be written.
+        prospective_freshclam_config: ClamAVConfig | None = None
         if freshclam_updates:
             if not self._window._freshclam_config:
                 self._show_error_dialog(
@@ -314,14 +323,20 @@ class SavePage(PreferencesPageMixin):
                 button.set_sensitive(True)
                 return
 
-            is_valid, errors = validate_config(self._window._freshclam_config)
+            freshclam_config = self._window._freshclam_config
+            prospective_freshclam_config = self._copy_config_for_path(
+                freshclam_config, freshclam_config.file_path
+            )
+            self._apply_updates_to_config(prospective_freshclam_config, freshclam_updates)
+            is_valid, errors = validate_config(prospective_freshclam_config)
             if not is_valid:
                 self._show_error_dialog(_("Validation Error"), "\n".join(errors))
                 self._is_saving = False
                 button.set_sensitive(True)
                 return
 
-        if clamd_updates and self._clamd_available:
+        prospective_clamd_config: ClamAVConfig | None = None
+        if (clamd_updates or onaccess_updates) and self._clamd_available:
             if not self._window._clamd_config:
                 self._show_error_dialog(
                     _("Configuration Error"),
@@ -334,7 +349,14 @@ class SavePage(PreferencesPageMixin):
                 button.set_sensitive(True)
                 return
 
-            is_valid, errors = validate_config(self._window._clamd_config)
+            # Validate the configuration that will actually be written, not the
+            # one that was loaded (#181).  A stale out-of-range value on disk
+            # must not block the edit that repairs it, and an out-of-range edit
+            # must not slip through because the pre-update config looked valid.
+            prospective_clamd_config = self._prospective_clamd_config(
+                clamd_updates, onaccess_updates
+            )
+            is_valid, errors = validate_config(prospective_clamd_config)
             if not is_valid:
                 self._show_error_dialog(_("Validation Error"), "\n".join(errors))
                 self._is_saving = False
@@ -350,6 +372,8 @@ class SavePage(PreferencesPageMixin):
                 onaccess_updates,
                 scheduled_updates,
                 button,
+                prospective_clamd_config,
+                prospective_freshclam_config,
             ),
         )
         save_thread.daemon = True
@@ -375,25 +399,21 @@ class SavePage(PreferencesPageMixin):
             raw_lines=list(config.raw_lines),
         )
 
-    def _flatpak_user_clamd_config_path(self) -> Path:
-        """Host-home clamd.conf path used for Flatpak clamscan-only settings."""
-        return Path.home() / ".config" / "clamav" / "clamd.conf"
-
-    def _should_use_flatpak_user_clamd_config(
+    def _prospective_clamd_config(
         self, clamd_updates: dict, onaccess_updates: dict
-    ) -> bool:
-        """Return whether clamd.conf can be saved as a Flatpak user config."""
-        if not clamd_updates or onaccess_updates or not is_flatpak():
-            return False
-        if privileged_writer_available():
-            return False
+    ) -> ClamAVConfig:
+        """Return the loaded clamd config with the collected updates applied.
 
-        try:
-            backend = self._settings_manager.get("scan_backend", "auto")
-        except Exception:
-            backend = "auto"
-
-        return backend == "clamscan" or (backend == "auto" and not self._clamd_available)
+        Validation has to run against this proposal rather than against the
+        loaded config: the loaded config may still hold the stale out-of-range
+        value the pending edit repairs, and a bad edit only becomes visible
+        once it has been applied.
+        """
+        clamd_config = self._window._clamd_config
+        prospective = self._copy_config_for_path(clamd_config, clamd_config.file_path)
+        self._apply_updates_to_config(prospective, clamd_updates)
+        self._apply_updates_to_config(prospective, onaccess_updates)
+        return prospective
 
     def _save_configs_thread(
         self,
@@ -402,6 +422,8 @@ class SavePage(PreferencesPageMixin):
         onaccess_updates: dict,
         scheduled_updates: dict,
         button: Gtk.Button,
+        prospective_clamd_config: ClamAVConfig | None = None,
+        prospective_freshclam_config: ClamAVConfig | None = None,
     ):
         """
         Save configuration files in a background thread.
@@ -410,12 +432,20 @@ class SavePage(PreferencesPageMixin):
         and manages error handling with thread-safe communication.
 
         Args:
-            freshclam_updates: Dictionary of freshclam.conf updates
-            clamd_updates: Dictionary of clamd.conf updates
-            onaccess_updates: Dictionary of On-Access scanning settings (clamd.conf)
-            scheduled_updates: Dictionary of scheduled scan settings
-            button: The save button to re-enable after completion
+            freshclam_updates: Dictionary of freshclam.conf updates.
+            clamd_updates: Dictionary of clamd.conf updates.
+            onaccess_updates: Dictionary of On-Access scanning settings
+                (clamd.conf).
+            scheduled_updates: Dictionary of scheduled scan settings.
+            button: The save button to re-enable after completion.
+            prospective_clamd_config: Validated clamd.conf proposal built in
+                _on_save_clicked, persisted only when its write succeeds, or None
+                when no clamd changes were collected for validation.
+            prospective_freshclam_config: Validated freshclam.conf proposal built
+                in _on_save_clicked, persisted only when its write succeeds, or
+                None when no freshclam changes were collected for validation.
         """
+        durable_groups: list[str] = []
         try:
             # Backup configurations
             backup_config(self._freshclam_conf_path)
@@ -423,62 +453,70 @@ class SavePage(PreferencesPageMixin):
                 backup_config(self._clamd_conf_path)
 
             configs_to_write = []
-            pending_clamd_conf_path: Path | None = None
-            pending_clamd_config: ClamAVConfig | None = None
             config_changes_applied = False
+            config_write_warning: str | None = None
+            system_clamd_config: ClamAVConfig | None = None
 
-            # Save freshclam.conf.  User-local freshclam.conf would be ignored by
-            # the current update paths, so freshclam changes intentionally stay
-            # on the system/elevated path.
+            # Save freshclam.conf. User-local freshclam config would be ignored by
+            # the current update path, so freshclam changes intentionally stay on
+            # the system/elevated path.
+            system_freshclam_config: ClamAVConfig | None = None
             if freshclam_updates and self._window._freshclam_config:
                 freshclam_config = self._window._freshclam_config
                 before = freshclam_config.to_string()
-                self._apply_updates_to_config(freshclam_config, freshclam_updates)
-                after = freshclam_config.to_string()
+                if prospective_freshclam_config is None:
+                    proposed_config = self._copy_config_for_path(
+                        freshclam_config, freshclam_config.file_path
+                    )
+                    self._apply_updates_to_config(proposed_config, freshclam_updates)
+                else:
+                    proposed_config = prospective_freshclam_config
+                after = proposed_config.to_string()
                 if not isinstance(before, str) or not isinstance(after, str) or before != after:
-                    configs_to_write.append(freshclam_config)
-
-            # Save clamd.conf (scanner settings plus on-access settings).
+                    configs_to_write.append(proposed_config)
+                    system_freshclam_config = proposed_config
             if (clamd_updates or onaccess_updates) and self._window._clamd_config:
                 clamd_config = self._window._clamd_config
                 before = clamd_config.to_string()
-                self._apply_updates_to_config(clamd_config, clamd_updates)
-                self._apply_updates_to_config(clamd_config, onaccess_updates)
-                after = clamd_config.to_string()
+                if prospective_clamd_config is None:
+                    proposed_config = self._copy_config_for_path(
+                        clamd_config, clamd_config.file_path
+                    )
+                    self._apply_updates_to_config(proposed_config, clamd_updates)
+                    self._apply_updates_to_config(proposed_config, onaccess_updates)
+                else:
+                    proposed_config = prospective_clamd_config
+                after = proposed_config.to_string()
                 if not isinstance(before, str) or not isinstance(after, str) or before != after:
-                    if self._should_use_flatpak_user_clamd_config(clamd_updates, onaccess_updates):
-                        pending_clamd_conf_path = self._flatpak_user_clamd_config_path()
-                        pending_clamd_config = self._copy_config_for_path(
-                            clamd_config, pending_clamd_conf_path
-                        )
-                    else:
-                        configs_to_write.append(clamd_config)
-
-            if pending_clamd_config is not None and pending_clamd_conf_path is not None:
-                success, error = write_configs_with_elevation([pending_clamd_config])
-                if not success:
-                    raise Exception(f"Failed to save configuration files: {error}")
-                self._settings_manager.set("clamd_conf_path", str(pending_clamd_conf_path))
-                if not self._settings_manager.save():
-                    raise Exception("Failed to save ClamUI settings")
-                self._clamd_conf_path = str(pending_clamd_conf_path)
-                self._window._clamd_conf_path = str(pending_clamd_conf_path)
-                self._window._clamd_config.file_path = pending_clamd_conf_path
-                config_changes_applied = True
+                    configs_to_write.append(proposed_config)
+                    system_clamd_config = proposed_config
 
             if configs_to_write:
                 success, error = write_configs_with_elevation(configs_to_write)
                 if not success:
                     raise Exception(f"Failed to save configuration files: {error}")
                 config_changes_applied = True
+                durable_groups.append(_("ClamAV configuration files"))
+                if error is not None:
+                    config_write_warning = error
 
-            # Save scheduled scan settings
+                # Once the helper reports success, the candidate configs are
+                # durable. Queue their main-thread commit before any subsequent
+                # settings or scheduler work so live memory cannot lag disk if
+                # one of those later operations fails.
+                def commit_written_configs():
+                    if system_freshclam_config is not None:
+                        self._window._freshclam_config = system_freshclam_config
+                    if system_clamd_config is not None:
+                        self._window._clamd_config = system_clamd_config
+
+                GLib.idle_add(commit_written_configs)
+
+            # Save scheduled scan settings atomically before acting on them.
             if scheduled_updates:
-                for key, value in scheduled_updates.items():
-                    self._settings_manager.set(key, value)
-                if not self._settings_manager.save():
-                    raise Exception("Failed to save scheduled scan settings")
-
+                if not self._settings_manager.set_many(scheduled_updates):
+                    raise Exception(_("Failed to save scheduled scan settings"))
+                durable_groups.append(_("Scheduled scan preferences"))
                 # Enable or disable scheduler based on settings
                 if scheduled_updates.get("scheduled_scans_enabled"):
                     success, error = self._scheduler.enable_schedule(
@@ -494,20 +532,32 @@ class SavePage(PreferencesPageMixin):
                         raise Exception(f"Failed to enable scheduled scans: {error}")
                 else:
                     # Disable scheduler if it was previously enabled
-                    self._scheduler.disable_schedule()
+                    success, error = self._scheduler.disable_schedule()
+                    if not success:
+                        raise Exception(f"Failed to disable scheduled scans: {error}")
 
             # Only report success if something was actually applied.  When the
             # user opens Save without modifying (or ever materializing) a
             # config-backed page, nothing is collected and nothing is written;
             # claiming "Configuration saved" in that case is misleading and was
             # one way the Flatpak persistence bug (#136) surfaced as a phantom
-            # success.
             if config_changes_applied or scheduled_updates:
-                GLib.idle_add(
-                    self._show_success_dialog,
-                    _("Configuration Saved"),
-                    _("Configuration saved. Active ClamAV services were restarted where needed."),
-                )
+                if config_write_warning is not None:
+                    GLib.idle_add(
+                        self._show_success_dialog,
+                        _("Configuration Saved with Warning"),
+                        _("Configuration saved with a warning:\n\n{warning}").format(
+                            warning=config_write_warning
+                        ),
+                    )
+                else:
+                    GLib.idle_add(
+                        self._show_success_dialog,
+                        _("Configuration Saved"),
+                        _(
+                            "Configuration saved. Active ClamAV services were restarted where needed."
+                        ),
+                    )
             else:
                 GLib.idle_add(
                     self._show_success_dialog,
@@ -520,7 +570,22 @@ class SavePage(PreferencesPageMixin):
         except Exception as e:
             # Store error for thread-safe handling
             self._scheduler_error = str(e)
-            GLib.idle_add(self._show_error_dialog, _("Save Failed"), str(e))
+            if durable_groups:
+                GLib.idle_add(
+                    self._show_error_dialog,
+                    _("Changes Partially Applied"),
+                    _(
+                        "The following changes were saved before another change failed:\n"
+                        "{saved_groups}\n\n"
+                        "Error: {error}\n\n"
+                        "Review your settings and save again."
+                    ).format(
+                        saved_groups=", ".join(durable_groups),
+                        error=str(e),
+                    ),
+                )
+            else:
+                GLib.idle_add(self._show_error_dialog, _("Save Failed"), str(e))
         finally:
             self._is_saving = False
             GLib.idle_add(button.set_sensitive, True)
