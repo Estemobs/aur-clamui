@@ -1,6 +1,6 @@
 # Maintainer: estemobs <estemobsgaming@gmail.com>
 pkgname=clamui
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Modern GTK4/libadwaita graphical interface for the ClamAV antivirus scanner"
 arch=('any')
@@ -34,7 +34,7 @@ optdepends=(
   'nemo: "Scan with ClamUI" action (Cinnamon)'
 )
 source=("$pkgname-$pkgver.tar.gz::https://github.com/linx-systems/clamui/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('ea6da57595c3d4265f43f3435bd39e1a38fd1529a3628e35654b84cb6dc799a5')
+sha256sums=('3718330c64beb8b6a541859d0123584fcec7c035a40a7d1ac3dad9b7e989d507')
 
 build() {
   cd "$pkgname-$pkgver"
